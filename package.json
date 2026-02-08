@@ -1,0 +1,60 @@
+{
+  "name": "treeshake-check",
+  "version": "1.0.0",
+  "description": "Analyze JavaScript/TypeScript React applications for tree-shaking issues",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "treeshake-check": "./bin/treeshake-check.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:coverage": "vitest --coverage",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "tree-shaking",
+    "bundle-analyzer",
+    "webpack",
+    "vite",
+    "rollup",
+    "esbuild",
+    "react",
+    "optimization",
+    "dead-code",
+    "cli"
+  ],
+  "author": "Mohammed ALjaberi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MohammedALjaberi/treeshake-check.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MohammedALjaberi/treeshake-check/issues"
+  },
+  "homepage": "https://github.com/MohammedALjaberi/treeshake-check#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "acorn-walk": "^8.3.2",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "glob": "^10.3.10",
+    "ora": "^8.0.1",
+    "source-map": "^0.7.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0"
+  }
+}
