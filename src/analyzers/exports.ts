@@ -8,9 +8,14 @@ import type {
   ModuleImport,
 } from "../types/index.js";
 
+interface ImportRecord {
+  importedName: string;
+  sourceFile: string;
+}
+
 interface ExportGraph {
   exports: Map<string, Set<string>>; // file -> exported names
-  imports: Map<string, Map<string, string>>; // file -> (imported name -> source file)
+  imports: Map<string, ImportRecord[]>; // file -> list of imports
 }
 
 /**
@@ -56,13 +61,13 @@ export async function analyzeUnusedExports(
 
 function buildExportGraph(files: string[], projectPath: string): ExportGraph {
   const exports = new Map<string, Set<string>>();
-  const imports = new Map<string, Map<string, string>>();
+  const imports = new Map<string, ImportRecord[]>();
 
   for (const file of files) {
     try {
       const content = readFileSync(file, "utf-8");
       const fileExports = new Set<string>();
-      const fileImports = new Map<string, string>();
+      const fileImports: ImportRecord[] = [];
 
       const ast = acorn.parse(content, {
         ecmaVersion: "latest",
@@ -72,12 +77,23 @@ function buildExportGraph(files: string[], projectPath: string): ExportGraph {
 
       walk.simple(ast, {
         ExportNamedDeclaration(node: any) {
-          // export { a, b }
           if (node.specifiers) {
             for (const spec of node.specifiers) {
               const exportedName = spec.exported?.name || spec.local?.name;
               if (exportedName) {
                 fileExports.add(exportedName);
+              }
+
+              // Re-export: export { X } from './module'
+              // This also counts as an import from the source module
+              if (node.source?.value) {
+                const localName = spec.local?.name;
+                if (localName) {
+                  fileImports.push({
+                    importedName: localName,
+                    sourceFile: resolveImportPath(file, node.source.value),
+                  });
+                }
               }
             }
           }
@@ -101,6 +117,12 @@ function buildExportGraph(files: string[], projectPath: string): ExportGraph {
           // export * from "..."
           if (node.source?.value) {
             fileExports.add(`* from ${node.source.value}`);
+
+            // Wildcard re-export counts as a namespace import from the source
+            fileImports.push({
+              importedName: "*",
+              sourceFile: resolveImportPath(file, node.source.value),
+            });
           }
         },
         ImportDeclaration(node: any) {
@@ -112,15 +134,21 @@ function buildExportGraph(files: string[], projectPath: string): ExportGraph {
             if (spec.type === "ImportSpecifier") {
               const importedName = spec.imported?.name;
               if (importedName) {
-                fileImports.set(
+                fileImports.push({
                   importedName,
-                  resolveImportPath(file, sourcePath),
-                );
+                  sourceFile: resolveImportPath(file, sourcePath),
+                });
               }
             } else if (spec.type === "ImportDefaultSpecifier") {
-              fileImports.set("default", resolveImportPath(file, sourcePath));
+              fileImports.push({
+                importedName: "default",
+                sourceFile: resolveImportPath(file, sourcePath),
+              });
             } else if (spec.type === "ImportNamespaceSpecifier") {
-              fileImports.set("*", resolveImportPath(file, sourcePath));
+              fileImports.push({
+                importedName: "*",
+                sourceFile: resolveImportPath(file, sourcePath),
+              });
             }
           }
         },
@@ -151,7 +179,7 @@ function findUnusedExports(
   const allImports = new Map<string, Set<string>>(); // source file -> imported names
 
   for (const [importingFile, fileImports] of graph.imports) {
-    for (const [importedName, sourceFile] of fileImports) {
+    for (const { importedName, sourceFile } of fileImports) {
       if (!allImports.has(sourceFile)) {
         allImports.set(sourceFile, new Set());
       }
