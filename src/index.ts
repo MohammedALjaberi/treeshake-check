@@ -14,7 +14,7 @@ program
   .description(
     "Analyze JavaScript/TypeScript React applications for tree-shaking issues",
   )
-  .version("1.0.0");
+  .version("1.0.2");
 
 program
   .command("analyze")

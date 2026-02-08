@@ -1,7 +1,7 @@
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
-import { readFileSync } from "fs";
-import { relative, dirname, resolve } from "path";
+import { readFileSync, existsSync, statSync } from "fs";
+import { relative, dirname, resolve, join } from "path";
 import type {
   TreeShakingIssue,
   ModuleExport,
@@ -186,26 +186,71 @@ function findUnusedExports(
   return unusedExports;
 }
 
+const RESOLVE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts"];
+
 function resolveImportPath(fromFile: string, importPath: string): string {
   // Handle relative imports
   if (importPath.startsWith(".")) {
     const dir = dirname(fromFile);
-    let resolved = resolve(dir, importPath);
+    const resolved = resolve(dir, importPath);
 
-    // Add common extensions if needed
-    const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts", ""];
-    for (const ext of extensions) {
-      if (resolved.endsWith(ext)) {
-        return resolved;
+    // 1. Exact path exists — could be a file or a directory
+    if (existsSync(resolved)) {
+      try {
+        if (statSync(resolved).isDirectory()) {
+          // Resolve directory to its index file (e.g. ./components -> ./components/index.ts)
+          return resolveIndexFile(resolved) || resolved;
+        }
+      } catch {
+        // statSync failed, treat as a file
+      }
+      return resolved;
+    }
+
+    // 2. Try adding extensions (e.g. ./utils -> ./utils.ts)
+    for (const ext of RESOLVE_EXTENSIONS) {
+      const withExt = resolved + ext;
+      if (existsSync(withExt)) {
+        return withExt;
       }
     }
 
-    // Try adding extensions
+    // 3. TypeScript convention: .js/.jsx in import maps to .ts/.tsx on disk
+    if (resolved.endsWith(".js")) {
+      const base = resolved.slice(0, -3);
+      for (const ext of [".ts", ".tsx", ".js"]) {
+        if (existsSync(base + ext)) return base + ext;
+      }
+    } else if (resolved.endsWith(".jsx")) {
+      const base = resolved.slice(0, -4);
+      for (const ext of [".tsx", ".jsx"]) {
+        if (existsSync(base + ext)) return base + ext;
+      }
+    }
+
+    // 4. Try as a directory with index file (e.g. ./components -> ./components/index.ts)
+    const indexResolved = resolveIndexFile(resolved);
+    if (indexResolved) return indexResolved;
+
+    // Fallback: return as-is (won't match, so the import is treated as external)
     return resolved;
   }
 
-  // For node_modules, return as-is
+  // For node_modules / bare specifiers, return as-is
   return importPath;
+}
+
+/**
+ * Resolve a directory path to its index file
+ */
+function resolveIndexFile(dirPath: string): string | null {
+  for (const ext of RESOLVE_EXTENSIONS) {
+    const indexPath = join(dirPath, `index${ext}`);
+    if (existsSync(indexPath)) {
+      return indexPath;
+    }
+  }
+  return null;
 }
 
 function isEntryPoint(file: string, projectPath: string): boolean {
