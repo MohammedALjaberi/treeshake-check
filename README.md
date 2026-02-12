@@ -8,6 +8,12 @@ A production-grade CLI tool to analyze JavaScript/TypeScript React applications 
 - 🌳 **Barrel file analysis** - Detect `export *` patterns that break tree-shaking
 - ⚠️ **Side effects detection** - Find top-level code that prevents dead code elimination
 - 📦 **CommonJS detection** - Identify modules that don't tree-shake
+- 🔗 **Unused export detection** - Find exports never imported anywhere in the codebase
+  - Tracks `import type` and inline type imports (TypeScript)
+  - Tracks dynamic `import()` and `require()` calls
+  - Resolves tsconfig `paths` aliases (e.g. `@/utils`)
+  - Smart entry point detection (Next.js pages/app router, Remix routes, config files, etc.)
+- 🔄 **Circular dependency detection** - Find import cycles that prevent tree-shaking
 - 📊 **Bundle stats parsing** - Analyze webpack stats.json, esbuild metafile, Vite/Rollup output
 - 💡 **Fix suggestions** - Actionable recommendations for each issue
 - 📋 **Multiple output formats** - Human-readable text or JSON for CI
@@ -164,14 +170,16 @@ Use `--output json` for CI integration:
 
 ## Issue Types
 
-| Type                         | Description                                  |
-| ---------------------------- | -------------------------------------------- |
-| `barrel-file`                | Barrel files with many re-exports            |
-| `wildcard-reexport`          | `export *` patterns that include all exports |
-| `side-effect`                | Top-level code that runs on import           |
-| `commonjs-module`            | CommonJS modules that don't tree-shake       |
-| `unused-export`              | Exports not imported anywhere                |
-| `missing-sideeffects-config` | Missing `sideEffects` in package.json        |
+| Type                         | Description                                         |
+| ---------------------------- | --------------------------------------------------- |
+| `barrel-file`                | Barrel files with many re-exports                   |
+| `wildcard-reexport`          | `export *` patterns that include all exports        |
+| `side-effect`                | Top-level code that runs on import                  |
+| `commonjs-module`            | CommonJS modules that don't tree-shake              |
+| `unused-export`              | Exports not imported anywhere in the codebase       |
+| `circular-dependency`        | Circular imports that prevent tree-shaking           |
+| `dynamic-import`             | Dynamic imports that may bypass tree-shaking         |
+| `missing-sideeffects-config` | Missing `sideEffects` in package.json               |
 
 ## License
 
