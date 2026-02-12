@@ -9,6 +9,20 @@ import type {
 } from "../types/index.js";
 import { stripLiteralsAndComments } from "../utils/strip-literals.js";
 
+// ── Module-level state for tsconfig path resolution ──────────────────────────
+let _currentProjectPath = "";
+
+interface TsconfigPathPattern {
+  prefix: string;
+  suffix: string;
+  targets: string[];
+}
+
+const _tsconfigCache = new Map<
+  string,
+  { patterns: TsconfigPathPattern[]; baseUrl: string }
+>();
+
 interface ImportRecord {
   importedName: string;
   sourceFile: string;
@@ -27,6 +41,10 @@ export async function analyzeUnusedExports(
   projectPath: string,
 ): Promise<TreeShakingIssue[]> {
   const issues: TreeShakingIssue[] = [];
+
+  // Set up module-level project path and pre-load tsconfig paths
+  _currentProjectPath = projectPath;
+  loadTsconfigPaths(projectPath);
 
   // Build complete export/import graph
   const graph = buildExportGraph(files, projectPath);
@@ -176,6 +194,33 @@ function buildExportGraph(files: string[], projectPath: string): ExportGraph {
               }
             }
           },
+          CallExpression(node: any) {
+            // Track require() calls as imports
+            if (
+              node.callee?.type === "Identifier" &&
+              node.callee.name === "require" &&
+              node.arguments?.length >= 1 &&
+              node.arguments[0]?.type === "Literal" &&
+              typeof node.arguments[0].value === "string"
+            ) {
+              fileImports.push({
+                importedName: "*",
+                sourceFile: resolveImportPath(file, node.arguments[0].value),
+              });
+            }
+          },
+          ImportExpression(node: any) {
+            // Track dynamic import() calls
+            if (
+              node.source?.type === "Literal" &&
+              typeof node.source.value === "string"
+            ) {
+              fileImports.push({
+                importedName: "*",
+                sourceFile: resolveImportPath(file, node.source.value),
+              });
+            }
+          },
         });
 
         parsed = true;
@@ -186,7 +231,13 @@ function buildExportGraph(files: string[], projectPath: string): ExportGraph {
 
       if (!parsed) {
         const strippedContent = stripLiteralsAndComments(content);
-        extractExportsAndImportsViaRegex(content, strippedContent, file, fileExports, fileImports);
+        extractExportsAndImportsViaRegex(
+          content,
+          strippedContent,
+          file,
+          fileExports,
+          fileImports,
+        );
       }
 
       exports.set(file, fileExports);
@@ -236,17 +287,29 @@ function extractExportsAndImportsViaRegex(
 
   // export { A, B, C } or export { A, B } from './module'
   // Run on content but validate position against strippedContent
-  const exportBraceRegex = /\bexport\s+\{([^}]+)\}(?:\s+from\s+['"]([^'"]+)['"])?/g;
+  const exportBraceRegex =
+    /\bexport\s+\{([^}]+)\}(?:\s+from\s+['"]([^'"]+)['"])?/g;
   for (const match of content.matchAll(exportBraceRegex)) {
     if (!inCode(match.index)) continue;
-    const names = match[1].split(",").map((s) => s.trim().split(/\s+as\s+/).pop()!.trim());
+    const names = match[1].split(",").map((s) =>
+      s
+        .trim()
+        .split(/\s+as\s+/)
+        .pop()!
+        .trim(),
+    );
     for (const name of names) {
       if (name) fileExports.add(name);
     }
     // Re-export also creates an import from the source
     if (match[2]) {
       const source = match[2];
-      const localNames = match[1].split(",").map((s) => s.trim().split(/\s+as\s+/)[0].trim());
+      const localNames = match[1].split(",").map((s) =>
+        s
+          .trim()
+          .split(/\s+as\s+/)[0]
+          .trim(),
+      );
       for (const localName of localNames) {
         if (localName) {
           fileImports.push({
@@ -279,15 +342,24 @@ function extractExportsAndImportsViaRegex(
 
   // ── Imports ────────────────────────────────────────────────────────
 
-  // import { A, B } from './module' (skip 'import type')
+  // import { A, B } from './module' (including inline type imports)
+  // Now also matches: import { type A, B } from './module'
   const namedImportRegex =
-    /\bimport\s+(?!type\b)\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
+    /\bimport\s+(?!type\s*\{)(?!type\s+[a-zA-Z])\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
   for (const match of content.matchAll(namedImportRegex)) {
     if (!inCode(match.index)) continue;
     const source = match[2];
-    const names = match[1]
-      .split(",")
-      .map((s) => s.trim().split(/\s+as\s+/)[0].trim());
+    const names = match[1].split(",").map((s) => {
+      let name = s
+        .trim()
+        .split(/\s+as\s+/)[0]
+        .trim();
+      // Handle inline type imports: import { type Foo, Bar } from '...'
+      if (name.startsWith("type ")) {
+        name = name.slice(5).trim();
+      }
+      return name;
+    });
     for (const name of names) {
       if (name) {
         fileImports.push({
@@ -313,6 +385,65 @@ function extractExportsAndImportsViaRegex(
   const namespaceImportRegex =
     /\bimport\s+\*\s+as\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s+from\s+['"]([^'"]+)['"]/g;
   for (const match of content.matchAll(namespaceImportRegex)) {
+    if (!inCode(match.index)) continue;
+    fileImports.push({
+      importedName: "*",
+      sourceFile: resolveImportPath(file, match[1]),
+    });
+  }
+
+  // ── Type Imports (TypeScript) ──────────────────────────────────────
+  // import type { X, Y } from './module'
+  const typeNamedImportRegex =
+    /\bimport\s+type\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
+  for (const match of content.matchAll(typeNamedImportRegex)) {
+    if (!inCode(match.index)) continue;
+    const source = match[2];
+    const names = match[1].split(",").map((s) =>
+      s
+        .trim()
+        .split(/\s+as\s+/)[0]
+        .trim(),
+    );
+    for (const name of names) {
+      if (name) {
+        fileImports.push({
+          importedName: name,
+          sourceFile: resolveImportPath(file, source),
+        });
+      }
+    }
+  }
+
+  // import type X from './module'
+  const typeDefaultImportRegex =
+    /\bimport\s+type\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s+from\s+['"]([^'"]+)['"]/g;
+  for (const match of content.matchAll(typeDefaultImportRegex)) {
+    if (!inCode(match.index)) continue;
+    // Skip if this was already matched by the named type import regex
+    const afterType = content.slice(match.index! + "import type ".length);
+    if (afterType.trimStart().startsWith("{")) continue;
+    fileImports.push({
+      importedName: "default",
+      sourceFile: resolveImportPath(file, match[2]),
+    });
+  }
+
+  // ── Dynamic import() ──────────────────────────────────────────────
+  // import('./module') or import("./module")
+  const dynamicImportRegex = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  for (const match of content.matchAll(dynamicImportRegex)) {
+    if (!inCode(match.index)) continue;
+    fileImports.push({
+      importedName: "*",
+      sourceFile: resolveImportPath(file, match[1]),
+    });
+  }
+
+  // ── require() calls ───────────────────────────────────────────────
+  // require('./module') or require("./module")
+  const requireRegex = /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+  for (const match of content.matchAll(requireRegex)) {
     if (!inCode(match.index)) continue;
     fileImports.push({
       importedName: "*",
@@ -493,6 +624,15 @@ function resolveImportPath(fromFile: string, importPath: string): string {
     return resolved;
   }
 
+  // Try tsconfig path aliases (e.g. @/utils -> src/utils)
+  if (_currentProjectPath) {
+    const aliasResolved = resolveWithTsconfigPaths(
+      importPath,
+      _currentProjectPath,
+    );
+    if (aliasResolved) return aliasResolved;
+  }
+
   // For node_modules / bare specifiers, return as-is
   return importPath;
 }
@@ -515,11 +655,41 @@ function isEntryPoint(file: string, projectPath: string): boolean {
 
   // Common entry point patterns
   const entryPatterns = [
+    // Standard entry points
     /^src\/index\./,
     /^src\/main\./,
     /^src\/app\./,
     /^index\./,
     /^main\./,
+    /^lib\/index\./,
+
+    // Next.js pages router and API routes
+    /^(src\/)?pages\/.+\./,
+    // Next.js app router (page, layout, loading, error, route, etc.)
+    /^(src\/)?app\/.*(page|layout|loading|error|not-found|template|default|route)\./,
+
+    // Remix / React Router routes
+    /^(src\/)?routes\/.+\./,
+
+    // Nuxt pages & server routes
+    /^(src\/)?server\/(api|routes|middleware)\/.+\./,
+
+    // Config files (vite.config.ts, next.config.js, etc.)
+    /\.config\.(js|ts|mjs|mts|cjs|cts)$/,
+
+    // Server / CLI entry points
+    /^(src\/)?server\./,
+    /^(src\/)?bin\//,
+    /^(src\/)?scripts\//,
+
+    // Middleware entry files
+    /^(src\/)?middleware\./,
+
+    // Worker files
+    /\.worker\./,
+
+    // Storybook stories (consumed by Storybook, not by code imports)
+    /\.stories\./,
   ];
 
   return entryPatterns.some((pattern) => pattern.test(relPath));
@@ -541,4 +711,128 @@ function getExportLine(file: string, exportName: string): number {
   }
 
   return 0;
+}
+
+// ============================================================================
+// tsconfig path alias resolution
+// ============================================================================
+
+/**
+ * Load and cache tsconfig.json path mappings for a project.
+ * Supports `compilerOptions.paths` and `compilerOptions.baseUrl`.
+ */
+function loadTsconfigPaths(projectPath: string): TsconfigPathPattern[] | null {
+  if (_tsconfigCache.has(projectPath)) {
+    return _tsconfigCache.get(projectPath)!.patterns;
+  }
+
+  const tsconfigPath = join(projectPath, "tsconfig.json");
+  if (!existsSync(tsconfigPath)) {
+    _tsconfigCache.set(projectPath, { patterns: [], baseUrl: "." });
+    return null;
+  }
+
+  try {
+    const raw = readFileSync(tsconfigPath, "utf-8");
+    // Strip JSON comments (tsconfig allows them)
+    const stripped = raw
+      .replace(/\/\/.*$/gm, "")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      // Remove trailing commas before } or ]
+      .replace(/,\s*([\]}])/g, "$1");
+    const tsconfig = JSON.parse(stripped);
+
+    const paths = tsconfig.compilerOptions?.paths as
+      | Record<string, string[]>
+      | undefined;
+    const baseUrl: string = tsconfig.compilerOptions?.baseUrl || ".";
+
+    if (!paths || Object.keys(paths).length === 0) {
+      _tsconfigCache.set(projectPath, { patterns: [], baseUrl });
+      return null;
+    }
+
+    const patterns: TsconfigPathPattern[] = [];
+
+    for (const [pattern, targets] of Object.entries(paths)) {
+      const starIndex = pattern.indexOf("*");
+      if (starIndex !== -1) {
+        patterns.push({
+          prefix: pattern.slice(0, starIndex),
+          suffix: pattern.slice(starIndex + 1),
+          targets: (targets as string[]).map((t) => {
+            const tStar = t.indexOf("*");
+            return tStar !== -1 ? t.slice(0, tStar) : t;
+          }),
+        });
+      } else {
+        // Exact match (no wildcard)
+        patterns.push({
+          prefix: pattern,
+          suffix: "",
+          targets: targets as string[],
+        });
+      }
+    }
+
+    _tsconfigCache.set(projectPath, { patterns, baseUrl });
+    return patterns;
+  } catch {
+    _tsconfigCache.set(projectPath, { patterns: [], baseUrl: "." });
+    return null;
+  }
+}
+
+/**
+ * Attempt to resolve an import path using tsconfig `paths` aliases.
+ * Returns the resolved absolute file path, or null if no alias matched.
+ */
+function resolveWithTsconfigPaths(
+  importPath: string,
+  projectPath: string,
+): string | null {
+  const cached = _tsconfigCache.get(projectPath);
+  if (!cached || cached.patterns.length === 0) return null;
+
+  const baseUrl = resolve(projectPath, cached.baseUrl);
+
+  for (const { prefix, suffix, targets } of cached.patterns) {
+    // Check if importPath matches the alias pattern
+    if (!importPath.startsWith(prefix)) continue;
+    if (suffix && !importPath.endsWith(suffix)) continue;
+
+    const wildcard = suffix
+      ? importPath.slice(prefix.length, -suffix.length || undefined)
+      : importPath.slice(prefix.length);
+
+    for (const target of targets) {
+      const resolvedBase = resolve(baseUrl, target + wildcard);
+
+      // Try exact path
+      if (existsSync(resolvedBase)) {
+        try {
+          if (statSync(resolvedBase).isDirectory()) {
+            const idx = resolveIndexFile(resolvedBase);
+            if (idx) return idx;
+          } else {
+            return resolvedBase;
+          }
+        } catch {
+          // statSync failed, continue
+        }
+      }
+
+      // Try adding extensions
+      for (const ext of RESOLVE_EXTENSIONS) {
+        const withExt = resolvedBase + ext;
+        if (existsSync(withExt)) return withExt;
+      }
+
+      // Try as directory with index file
+      const indexResolved = resolveIndexFile(resolvedBase);
+      if (indexResolved) return indexResolved;
+    }
+  }
+
+  return null;
 }
