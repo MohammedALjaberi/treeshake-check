@@ -14,6 +14,19 @@ window.UILibraryVersion = "1.0.0";
 // Issue 4: CommonJS require mixed with ESM
 const lodash = require("lodash");
 
+// Issue 5: Problematic ESM imports (default import of non-tree-shakeable lib)
+import moment from "moment";
+
+// Issue 6: Namespace import of large library
+import * as Icons from "@mui/icons-material";
+
+// Issue 7: Bare side-effect import
+import "./polyfills";
+
+// Issue 8: Non-static dynamic import
+const page = "home";
+const mod = import(page);
+
 // Unused export
 export const UNUSED_CONSTANT = "never-imported";
 

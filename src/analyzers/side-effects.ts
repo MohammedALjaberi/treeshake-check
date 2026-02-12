@@ -3,6 +3,7 @@ import * as walk from "acorn-walk";
 import { readFileSync, existsSync } from "fs";
 import { join, relative } from "path";
 import type { TreeShakingIssue, IssueSeverity } from "../types/index.js";
+import { stripLiteralsAndComments } from "../utils/strip-literals.js";
 
 // Known side-effect patterns at the top level
 const SIDE_EFFECT_PATTERNS = [
@@ -28,6 +29,23 @@ const SIDE_EFFECT_CALLS = new Set([
   "confirm",
   "prompt",
 ]);
+
+// Bare import pattern: `import './file'` or `import 'polyfill'` (no specifiers)
+const BARE_IMPORT_REGEX =
+  /^\s*import\s+['"]([^'"]+)['"]\s*;?\s*$/gm;
+
+// Known CSS / style extensions that are expected bare imports
+const STYLE_EXTENSIONS = /\.(css|scss|sass|less|styl|stylus)$/;
+
+// Known polyfill / side-effect modules that should be flagged
+const KNOWN_SIDE_EFFECT_MODULES = [
+  "core-js",
+  "regenerator-runtime",
+  "whatwg-fetch",
+  "raf/polyfill",
+  "intersection-observer",
+  "resize-observer-polyfill",
+];
 
 /**
  * Analyze files for side effects that prevent tree-shaking
@@ -58,17 +76,18 @@ function analyzeFileSideEffects(
 ): TreeShakingIssue[] {
   const issues: TreeShakingIssue[] = [];
   const relPath = relative(projectPath, filePath);
+  const strippedContent = stripLiteralsAndComments(content);
 
   // Quick regex check for common side effect patterns
   for (const pattern of SIDE_EFFECT_PATTERNS) {
-    if (pattern.test(content)) {
-      const match = content.match(pattern);
+    if (pattern.test(strippedContent)) {
+      const match = strippedContent.match(pattern);
       if (match) {
-        const line = content.substring(0, match.index).split("\n").length;
+        const line = strippedContent.substring(0, match.index).split("\n").length;
         const matchedText = match[0].trim();
 
         // Skip if it's inside a function (we only care about top-level)
-        if (!isTopLevel(content, match.index || 0)) {
+        if (!isTopLevel(strippedContent, match.index || 0)) {
           continue;
         }
 
@@ -161,7 +180,97 @@ function analyzeFileSideEffects(
       },
     });
   } catch {
-    // Ignore parsing errors, rely on regex detection
+    // AST parsing failed (likely TypeScript / JSX) — use regex fallback
+    // for side-effect function calls at top level
+    const topLevelCallRegex =
+      /^(?:(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*)?(setTimeout|setInterval|addEventListener|fetch|alert|confirm|prompt)\s*\(/gm;
+    for (const match of content.matchAll(topLevelCallRegex)) {
+      const calleeName = match[1];
+      const line = content.substring(0, match.index).split("\n").length;
+      if (isTopLevel(content, match.index || 0)) {
+        issues.push({
+          type: "side-effect",
+          severity: "high",
+          file: relPath,
+          line,
+          pattern: `${calleeName}() at top level`,
+          description: `Top-level call to ${calleeName}() is a side effect that prevents tree-shaking.`,
+          estimatedImpact: 1000,
+          suggestion: {
+            title: "Move to an initialization function",
+            description: `Wrap ${calleeName}() call in an exported function.`,
+          },
+        });
+      }
+    }
+
+    // Regex fallback for global assignments: window.X = ... / global.X = ...
+    const globalAssignRegex =
+      /^\s*(window|global|globalThis)\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=/gm;
+    for (const match of content.matchAll(globalAssignRegex)) {
+      const objName = match[1];
+      const propName = match[2];
+      const line = content.substring(0, match.index).split("\n").length;
+      if (isTopLevel(content, match.index || 0)) {
+        issues.push({
+          type: "side-effect",
+          severity: "high",
+          file: relPath,
+          line,
+          pattern: `Global assignment: ${objName}.${propName}`,
+          description:
+            "Global variable assignment is a side effect that prevents tree-shaking.",
+          estimatedImpact: 500,
+          suggestion: {
+            title: "Avoid global assignments",
+            description:
+              "Use module-scoped variables or dependency injection instead.",
+          },
+        });
+      }
+    }
+  }
+
+  // ── Bare / side-effect imports ────────────────────────────────────────
+  // Detect `import './file'` and `import 'polyfill'` style imports
+  // Use content for value extraction; the `^` anchor + `import` keyword
+  // provide enough context to avoid false positives from strings
+  const bareImportRegex = /^\s*import\s+['"]([^'"]+)['"]\s*;?\s*$/gm;
+  for (const match of content.matchAll(bareImportRegex)) {
+    // Validate against strippedContent
+    if (match.index !== undefined && strippedContent[match.index + match[0].search(/import/)] === " ") continue;
+    const importPath = match[1];
+    const line = content.substring(0, match.index).split("\n").length;
+
+    // Skip CSS/style imports — those are expected bare imports
+    if (STYLE_EXTENSIONS.test(importPath)) continue;
+
+    const isKnownPolyfill = KNOWN_SIDE_EFFECT_MODULES.some((mod) =>
+      importPath.startsWith(mod),
+    );
+
+    const severity: IssueSeverity = isKnownPolyfill ? "medium" : "low";
+
+    issues.push({
+      type: "side-effect",
+      severity,
+      file: relPath,
+      line,
+      pattern: `import '${importPath}'`,
+      description: `Bare import of '${importPath}' is a side-effect import. The entire module is executed on import, which prevents tree-shaking of this dependency.${isKnownPolyfill ? " Consider loading this polyfill conditionally." : ""}`,
+      estimatedImpact: isKnownPolyfill ? 5000 : 1000,
+      suggestion: {
+        title: isKnownPolyfill
+          ? "Load polyfill conditionally"
+          : "Review if side-effect import is necessary",
+        description: isKnownPolyfill
+          ? "Load polyfills only when needed, or use a service like polyfill.io."
+          : "If this import has exports you use, import them explicitly. If it's only for side effects, document why.",
+        code: isKnownPolyfill
+          ? `if (!('fetch' in window)) { await import('${importPath}') }`
+          : undefined,
+      },
+    });
   }
 
   return issues;
